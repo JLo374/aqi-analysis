@@ -30,6 +30,7 @@ ENV/
 # Output files
 outputs/*
 !outputs/.gitkeep
+!outputs/sample_aqi_data.csv
 
 # IDE
 .vscode/
