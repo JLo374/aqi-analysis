@@ -1,0 +1,354 @@
+﻿"""
+AQI 監測站資料擷取與視覺化腳本
+使用 MOENV API 獲取即時 AQI 資料並使用 Folium 繪製地圖
+"""
+
+import os
+import sys
+import subprocess
+import json
+from datetime import datetime
+from pathlib import Path
+
+def install_requirements():
+    """自動安裝所需套件"""
+    requirements_file = Path(__file__).parent.parent / 'requirements.txt'
+    
+    if requirements_file.exists():
+        print("正在檢查並安裝所需套件...")
+        try:
+            subprocess.check_call([
+                sys.executable, '-m', 'pip', 'install', '-r', str(requirements_file), '--quiet'
+            ])
+            print("✓ 套件安裝完成\n")
+        except subprocess.CalledProcessError as e:
+            print(f"⚠ 套件安裝時發生錯誤: {e}")
+            sys.exit(1)
+    else:
+        print("找不到 requirements.txt 檔案")
+        sys.exit(1)
+
+# 自動安裝套件
+install_requirements()
+
+# 導入所需模組
+import requests
+from dotenv import load_dotenv
+import folium
+import pandas as pd
+from math import radians, cos, sin, asin, sqrt
+
+# 載入環境變數
+env_path = Path(__file__).parent.parent / '.env'
+load_dotenv(env_path)
+
+# API 設定
+MOENV_API_KEY = os.getenv('MOENV_API_KEY')
+API_BASE_URL = 'https://data.moenv.gov.tw/api/v2'
+DATASET_ID = 'aqx_p_432'  # AQI 資料集
+
+# 台北車站座標
+TAIPEI_MAIN_STATION = {
+    'name': '台北車站',
+    'latitude': 25.0478,
+    'longitude': 121.5170
+}
+
+def fetch_aqi_data(limit=1000, offset=0):
+    """
+    從 MOENV API 獲取 AQI 資料
+    
+    Parameters:
+        limit (int): 每次請求的資料筆數上限
+        offset (int): 資料偏移量
+        
+    Returns:
+        dict: API 回應的 JSON 資料
+    """
+    if not MOENV_API_KEY:
+        raise ValueError("❌ 找不到 MOENV_API_KEY，請確認 .env 檔案中已設定 API Key")
+    
+    url = f"{API_BASE_URL}/{DATASET_ID}"
+    
+    params = {
+        'api_key': MOENV_API_KEY,
+        'limit': limit,
+        'offset': offset,
+        'format': 'json'
+    }
+    
+    print(f"正在從 MOENV API 獲取 AQI 資料...")
+    print(f"API 端點: {url}")
+    
+    try:
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+
+        data = response.json()
+        print(f"✓ 成功獲取資料")
+
+        # 輸出 API 回應的結構以便除錯
+        print(f"API 回應的頂層鍵值: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
+
+        return data
+
+    except requests.exceptions.RequestException as e:
+        print(f"❌ API 請求失敗: {e}")
+        sys.exit(1)
+
+def process_aqi_data(data):
+    """
+    處理 AQI 資料並轉換為 DataFrame
+
+    Parameters:
+        data (dict): API 回應的 JSON 資料
+
+    Returns:
+        pd.DataFrame: 處理後的資料
+    """
+    # 檢查不同可能的資料結構
+    records = None
+
+    if isinstance(data, list):
+        # 如果 API 直接回傳陣列
+        records = data
+        print(f"✓ API 回傳陣列格式")
+    elif isinstance(data, dict):
+        # 嘗試不同的可能鍵值
+        if 'records' in data:
+            records = data['records']
+        elif 'data' in data:
+            records = data['data']
+        elif 'result' in data:
+            records = data['result']
+        else:
+            print(f"❌ API 回應格式不正確。可用的鍵值: {list(data.keys())}")
+            return pd.DataFrame()
+    else:
+        print(f"❌ API 回應格式不正確（非陣列也非物件）")
+        return pd.DataFrame()
+
+    if not records:
+        print("❌ 沒有找到資料記錄")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    
+    print(f"✓ 共獲取 {len(df)} 筆監測站資料")
+    
+    # 轉換數值型欄位
+    numeric_columns = ['latitude', 'longitude', 'aqi']
+    for col in numeric_columns:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    
+    # 移除無效的經緯度資料
+    df = df.dropna(subset=['latitude', 'longitude'])
+    df = df[(df['latitude'] != 0) & (df['longitude'] != 0)]
+
+    print(f"✓ 處理後有效資料: {len(df)} 筆")
+
+    # 計算每個監測站到台北車站的距離
+    print(f"正在計算各監測站到{TAIPEI_MAIN_STATION['name']}的距離...")
+    df['distance_to_taipei_km'] = df.apply(
+        lambda row: haversine_distance(
+            row['latitude'], 
+            row['longitude'],
+            TAIPEI_MAIN_STATION['latitude'],
+            TAIPEI_MAIN_STATION['longitude']
+        ),
+        axis=1
+    )
+    print(f"✓ 距離計算完成\n")
+
+    return df
+
+def get_aqi_color(aqi):
+    """根據 AQI 值返回對應的顏色（簡化版：三級分類）"""
+    try:
+        aqi_value = float(aqi) if pd.notna(aqi) else 0
+    except (ValueError, TypeError):
+        return 'gray'
+
+    if aqi_value <= 50:
+        return 'green'      # 良好 (0-50)
+    elif aqi_value <= 100:
+        return 'yellow'     # 普通 (51-100)
+    else:
+        return 'red'        # 不健康 (101+)
+
+def get_aqi_status(aqi):
+    """根據 AQI 值返回狀態文字（簡化版：三級分類）"""
+    try:
+        aqi_value = float(aqi) if pd.notna(aqi) else 0
+    except (ValueError, TypeError):
+        return '無資料'
+
+    if aqi_value <= 50:
+        return '良好'
+    elif aqi_value <= 100:
+        return '普通'
+    else:
+        return '不健康'
+
+def create_aqi_map(df, output_path):
+    """
+    使用 Folium 建立 AQI 監測站地圖
+    
+    Parameters:
+        df (pd.DataFrame): AQI 資料
+        output_path (str): 輸出檔案路徑
+    """
+    # 以台灣中心點為地圖中心
+    taiwan_center = [23.5, 121.0]
+    
+    # 建立地圖
+    m = folium.Map(
+        location=taiwan_center,
+        zoom_start=7,
+        tiles='OpenStreetMap'
+    )
+    
+    # 加入每個監測站的標記
+    for idx, row in df.iterrows():
+        lat = row.get('latitude')
+        lon = row.get('longitude')
+        site_name = row.get('sitename', '未知站點')
+        county = row.get('county', '')
+        aqi = row.get('aqi', 'N/A')
+        pollutant = row.get('pollutant', 'N/A')
+        status = row.get('status', '')
+        publish_time = row.get('publishtime', '')
+        
+        # 建立彈出視窗內容
+        popup_html = f"""
+        <div style="font-family: Arial, sans-serif; width: 250px;">
+            <h4 style="margin-bottom: 10px; color: #2c3e50;">{site_name}</h4>
+            <table style="width: 100%; font-size: 12px;">
+                <tr><td><b>縣市：</b></td><td>{county}</td></tr>
+                <tr><td><b>AQI：</b></td><td style="color: {get_aqi_color(aqi)}; font-weight: bold;">{aqi}</td></tr>
+                <tr><td><b>狀態：</b></td><td>{get_aqi_status(aqi)}</td></tr>
+                <tr><td><b>主要污染物：</b></td><td>{pollutant}</td></tr>
+                <tr><td><b>狀態：</b></td><td>{status}</td></tr>
+                <tr><td><b>發布時間：</b></td><td>{publish_time}</td></tr>
+            </table>
+        </div>
+        """
+        
+        # 加入標記
+        folium.CircleMarker(
+            location=[lat, lon],
+            radius=8,
+            popup=folium.Popup(popup_html, max_width=300),
+            tooltip=f"{site_name} (AQI: {aqi})",
+            color=get_aqi_color(aqi),
+            fill=True,
+            fillColor=get_aqi_color(aqi),
+            fillOpacity=0.7,
+            weight=2
+        ).add_to(m)
+    
+    # 加入圖例（簡化版：三級分類）
+    legend_html = '''
+    <div style="position: fixed; 
+                bottom: 50px; right: 50px; width: 180px; height: auto; 
+                background-color: white; border: 2px solid #666; z-index: 9999; 
+                font-size: 14px; padding: 15px; border-radius: 8px; 
+                box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+                font-family: 'Microsoft JhengHei', Arial, sans-serif;">
+        <p style="margin: 0 0 10px 0; font-weight: bold; font-size: 16px; color: #2c3e50;">
+            AQI 空氣品質指標
+        </p>
+        <div style="margin: 8px 0; display: flex; align-items: center;">
+            <div style="width: 20px; height: 20px; background-color: green; 
+                        border-radius: 50%; margin-right: 10px; border: 1px solid #333;"></div>
+            <span><b>0-50:</b> 良好</span>
+        </div>
+        <div style="margin: 8px 0; display: flex; align-items: center;">
+            <div style="width: 20px; height: 20px; background-color: yellow; 
+                        border-radius: 50%; margin-right: 10px; border: 1px solid #333;"></div>
+            <span><b>51-100:</b> 普通</span>
+        </div>
+        <div style="margin: 8px 0; display: flex; align-items: center;">
+            <div style="width: 20px; height: 20px; background-color: red; 
+                        border-radius: 50%; margin-right: 10px; border: 1px solid #333;"></div>
+            <span><b>101+:</b> 不健康</span>
+        </div>
+    </div>
+    '''
+    m.get_root().html.add_child(folium.Element(legend_html))
+    
+    # 儲存地圖
+    m.save(output_path)
+    print(f"✓ 地圖已儲存至: {output_path}")
+
+def save_data(df, output_dir):
+    """
+    儲存原始資料為 CSV 和 JSON 格式
+    
+    Parameters:
+        df (pd.DataFrame): AQI 資料
+        output_dir (Path): 輸出目錄
+    """
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    # 儲存 CSV
+    csv_path = output_dir / f'aqi_data_{timestamp}.csv'
+    df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+    print(f"✓ CSV 資料已儲存至: {csv_path}")
+    
+    # 儲存 JSON
+    json_path = output_dir / f'aqi_data_{timestamp}.json'
+    df.to_json(json_path, orient='records', force_ascii=False, indent=2)
+    print(f"✓ JSON 資料已儲存至: {json_path}")
+    
+    return csv_path, json_path
+
+def main():
+    """主程式"""
+    print("=" * 60)
+    print("AQI 監測站資料擷取與視覺化")
+    print("=" * 60)
+    print()
+    
+    # 設定輸出目錄
+    project_root = Path(__file__).parent.parent
+    output_dir = project_root / 'outputs'
+    output_dir.mkdir(exist_ok=True)
+    
+    # 1. 獲取 AQI 資料
+    raw_data = fetch_aqi_data()
+    
+    # 2. 處理資料
+    df = process_aqi_data(raw_data)
+    
+    if df.empty:
+        print("❌ 沒有可用的資料")
+        sys.exit(1)
+    
+    # 3. 顯示統計資訊
+    print("資料統計：")
+    print(f"  監測站數量: {len(df)}")
+    print(f"  縣市數量: {df['county'].nunique() if 'county' in df.columns else 'N/A'}")
+    if 'aqi' in df.columns:
+        print(f"  平均 AQI: {df['aqi'].mean():.2f}")
+        print(f"  最高 AQI: {df['aqi'].max():.0f}")
+        print(f"  最低 AQI: {df['aqi'].min():.0f}")
+    print()
+    
+    # 4. 儲存資料
+    csv_path, json_path = save_data(df, output_dir)
+    
+    # 5. 建立地圖
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    map_path = output_dir / f'aqi_map_{timestamp}.html'
+    create_aqi_map(df, str(map_path))
+    
+    print()
+    print("=" * 60)
+    print("✓ 所有作業完成！")
+    print(f"請開啟 {map_path} 查看互動式地圖")
+    print("=" * 60)
+
+if __name__ == "__main__":
+    main()
