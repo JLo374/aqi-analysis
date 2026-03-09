@@ -31,10 +31,13 @@ ENV/
 outputs/*
 !outputs/.gitkeep
 !outputs/sample_aqi_data.csv
+!outputs/reflection.md
+!outputs/audit_report.md
 
 # IDE
 .vscode/
 .idea/
+.vs/
 *.swp
 *.swo
 *~
